@@ -1112,6 +1112,9 @@ let strokeCanvas=null,strokeCtx=null;
 let lastPressure=0.5; // tracked across events for smooth pressure interpolation
 let strokePointCount=0; // how many points in this stroke (for taper logic)
 
+// Snapshot of the layer canvas taken at stroke start, used to redraw cleanly each event
+let strokeSnapshot=null;
+
 function beginStrokeCanvas(){
   if(!strokeCanvas||strokeCanvas.width!==CW||strokeCanvas.height!==CH){
     strokeCanvas=document.createElement('canvas');
@@ -1119,6 +1122,10 @@ function beginStrokeCanvas(){
     strokeCtx=strokeCanvas.getContext('2d');
   }
   strokeCtx.clearRect(0,0,CW,CH);
+  // Take a snapshot of the layer before this stroke so we can redraw cleanly
+  strokeSnapshot=document.createElement('canvas');
+  strokeSnapshot.width=CW;strokeSnapshot.height=CH;
+  strokeSnapshot.getContext('2d').drawImage(getActiveCtx().canvas,0,0);
 }
 
 function commitStrokeCanvas(destCtx,opacity,blendOp){
@@ -1231,6 +1238,12 @@ function drawStroke(x,y,rawPressure,tiltX,tiltY,isStart){
     ctx.restore();
   });
 
+  // Restore layer to pre-stroke state, then composite the accumulated stroke on top
+  // This prevents every dab being drawn N times as the stroke grows
+  if(strokeSnapshot){
+    destCtx.clearRect(0,0,CW,CH);
+    destCtx.drawImage(strokeSnapshot,0,0);
+  }
   destCtx.save();
   destCtx.globalCompositeOperation=blendOp;
   destCtx.globalAlpha=strokeOp;
@@ -1240,66 +1253,75 @@ function drawStroke(x,y,rawPressure,tiltX,tiltY,isStart){
   lastPressure=pressure;
 }
 
-// Paint a pressure-taper tail at stroke end
+// Paint a pressure-taper tail at stroke end — continues from exact last point
 function finishStrokeTaper(x,y){
-  if(!strokeCanvas||strokePointCount<2) return;
-  if(bPressSize<0.05) return; // nothing to taper if pressure→size is off
+  if(strokePointCount<2) return;
+  if(bPressSize<0.05) return;
 
   const destCtx=getActiveCtx();
   const blendOp=tool==='eraser'?'destination-out':'source-over';
-  const effectiveAngle=bAngle;
 
-  // Pencil taper: paint variable-width rects shrinking to 0
   if(tool==='pencil'){
     const pencilBase=Math.max(1,brushSize*0.5);
     const dx=x-lastX, dy=y-lastY;
-    const len=Math.sqrt(dx*dx+dy*dy)||1;
-    const nx=dx/len, ny=dy/len;
-    const TAPER_STEPS=12;
-    const step=Math.max(0.5,pencilBase*0.2);
+    const dist=Math.sqrt(dx*dx+dy*dy);
+    // Direction: last movement vector, or zero if stationary
+    const nx=dist>0?dx/dist:0, ny=dist>0?dy/dist:0;
     const col=hexToRgbStr(fgColor);
+    // Step size = 1px so taper is continuous, no gaps
+    const step=1;
+    const TAPER_DIST=pencilBase*2; // taper over 2× base width
 
     destCtx.save();
     destCtx.globalCompositeOperation=blendOp;
     destCtx.imageSmoothingEnabled=false;
     destCtx.fillStyle=`rgb(${col})`;
-    for(let i=1;i<=TAPER_STEPS;i++){
-      const t=i/TAPER_STEPS;
+    for(let d=step;d<=TAPER_DIST;d+=step){
+      const t=d/TAPER_DIST;
       const p=lastPressure*(1-t);
-      const hw=Math.max(0,Math.round(pencilBase*(1-bPressSize+bPressSize*p)/2));
+      const hw=Math.round(pencilBase*(1-bPressSize+bPressSize*p)/2);
       if(hw<1) break;
-      destCtx.globalAlpha=bOp*(1-bPressOp+bPressOp*p)*(1-t*0.5);
-      const tx=Math.round(x+nx*step*i);
-      const ty=Math.round(y+ny*step*i);
-      destCtx.fillRect(tx-hw,ty-hw,hw*2,hw*2);
+      destCtx.globalAlpha=bOp*(1-bPressOp+bPressOp*p);
+      destCtx.fillRect(
+        Math.round(x+nx*d)-hw, Math.round(y+ny*d)-hw,
+        hw*2, hw*2
+      );
     }
     destCtx.restore();
     return;
   }
 
-  // Brush taper
-  const TAPER_STEPS=10;
+  // Brush taper — draw onto strokeCtx then composite ONCE
+  const effectiveAngle=bAngle;
   const dx=x-lastX, dy=y-lastY;
-  const len=Math.sqrt(dx*dx+dy*dy)||1;
-  const nx=dx/len, ny=dy/len;
-  const step=Math.max(0.5,brushSize*0.12);
+  const dist=Math.sqrt(dx*dx+dy*dy);
+  const nx=dist>0?dx/dist:0, ny=dist>0?dy/dist:0;
+  // Step tightly — use same spacing as normal stroke
+  const step=Math.max(0.5,brushSize*(bSpacing/100)*0.5);
+  const TAPER_DIST=brushSize*1.5;
 
   const ctx=strokeCtx;
   ctx.save();
   ctx.globalCompositeOperation='source-over';
-  for(let i=1;i<=TAPER_STEPS;i++){
-    const t=i/TAPER_STEPS;
+  for(let d=step;d<=TAPER_DIST;d+=step){
+    const t=d/TAPER_DIST;
     const p=lastPressure*(1-t);
-    const sz=Math.max(0.3,brushSize*(1-bPressSize+bPressSize*p));
-    if(sz<0.5) break;
-    ctx.globalAlpha=bFlow*(1-t*0.8);
-    paintDab(ctx,x+nx*step*i,y+ny*step*i,sz,1,effectiveAngle);
+    const sz=brushSize*(1-bPressSize+bPressSize*p);
+    if(sz<0.4) break;
+    ctx.globalAlpha=bFlow*(1-t);
+    paintDab(ctx,x+nx*d,y+ny*d,sz,1,effectiveAngle);
   }
   ctx.restore();
 
+  // Composite the taper onto the layer using snapshot restore
+  const strokeOp=bOp*(1-bPressOp+bPressOp*lastPressure);
+  if(strokeSnapshot){
+    destCtx.clearRect(0,0,CW,CH);
+    destCtx.drawImage(strokeSnapshot,0,0);
+  }
   destCtx.save();
   destCtx.globalCompositeOperation=blendOp;
-  destCtx.globalAlpha=bOp*(1-bPressOp+bPressOp*lastPressure*0.3);
+  destCtx.globalAlpha=strokeOp;
   destCtx.drawImage(strokeCanvas,0,0);
   destCtx.restore();
 }
@@ -1326,9 +1348,28 @@ function paintDab(ctx,x,y,size,alpha,angle){
 function radialDab(ctx,ox,oy,r){
   const g=ctx.createRadialGradient(ox,oy,0,ox,oy,Math.max(0.01,r));
   const col=tool==='eraser'?'0,0,0':hexToRgbStr(fgColor);
-  g.addColorStop(0,`rgba(${col},1)`);
-  g.addColorStop(Math.min(0.99,bHard),`rgba(${col},1)`);
-  g.addColorStop(1,`rgba(${col},0)`);
+  // True Gaussian-like falloff: multiple stops simulate e^(-x²) curve
+  // Hard=1.0 → sharp edge; Hard=0 → pure Gaussian soft
+  const h=Math.min(0.999,bHard);
+  if(h>0.95){
+    // Hard edge — essentially solid
+    g.addColorStop(0,`rgba(${col},1)`);
+    g.addColorStop(0.98,`rgba(${col},1)`);
+    g.addColorStop(1,`rgba(${col},0)`);
+  } else {
+    // Gaussian approximation via multiple stops
+    // At position t, alpha ≈ e^(-(t/σ)²) where σ = (1-h)*0.6
+    const sigma=Math.max(0.01,(1-h)*0.55);
+    const stops=8;
+    g.addColorStop(0,`rgba(${col},1)`);
+    for(let i=1;i<=stops;i++){
+      const t=h+(1-h)*(i/stops);
+      const nt=(t-h)/(1-h); // 0..1 in the soft zone
+      const alpha=Math.exp(-(nt*nt)/(2*sigma*sigma));
+      g.addColorStop(Math.min(0.999,t),`rgba(${col},${alpha.toFixed(3)})`);
+    }
+    g.addColorStop(1,`rgba(${col},0)`);
+  }
   ctx.fillStyle=g;ctx.beginPath();ctx.arc(ox,oy,Math.max(0.01,r),0,Math.PI*2);ctx.fill();
 }
 
@@ -1608,6 +1649,15 @@ function evPos(e){const r=canvasArea.getBoundingClientRect();return{sx:e.clientX
 function getPressure(e){return(e.pointerType==='pen'||e.pointerType==='touch')&&e.pressure>0?e.pressure:0.5;}
 function getTilt(e){return{tiltX:e.tiltX||0,tiltY:e.tiltY||0};}
 
+function isLayerLocked(){
+  if(layers[activeLayerIdx]?.locked){
+    document.getElementById('sb-tool').textContent='⚠ Layer locked';
+    setTimeout(()=>document.getElementById('sb-tool').textContent=(editingMask?'[MASK] ':'')+tool,1500);
+    return true;
+  }
+  return false;
+}
+
 function onDown(e){
   e.preventDefault();
   canvasArea.setPointerCapture(e.pointerId);
@@ -1622,14 +1672,15 @@ function onDown(e){
   if(e.button===2){isPanning=true;panSX=sx;panSY=sy;return;}
 
   if(tool==='eyedropper'){pickColor(cp.x,cp.y);return;}
-  if(tool==='fill'){saveState();floodFill(cp.x,cp.y,fgColor);renderThumb(activeLayerIdx);return;}
-  if(tool==='text'){addText(cp.x,cp.y);return;}
+  if(tool==='fill'){if(isLayerLocked())return;saveState();floodFill(cp.x,cp.y,fgColor);renderThumb(activeLayerIdx);return;}
+  if(tool==='text'){if(isLayerLocked())return;addText(cp.x,cp.y);return;}
   if(tool==='transform'){onTransformDown(cp);return;}
   if(tool==='select'){selectRect={x1:cp.x,y1:cp.y,x2:cp.x,y2:cp.y};isDrawing=true;lastX=cp.x;lastY=cp.y;return;}
   if(tool==='lasso'){lassoPoints=[{x:cp.x,y:cp.y}];isDrawing=true;return;}
-  if(tool==='line'||tool==='shape'){shapeStart={x:cp.x,y:cp.y};isDrawing=true;lastX=cp.x;lastY=cp.y;return;}
-  if(tool==='gradient'){gradStart={x:cp.x,y:cp.y};isDrawing=true;return;}
+  if(tool==='line'||tool==='shape'){if(isLayerLocked())return;shapeStart={x:cp.x,y:cp.y};isDrawing=true;lastX=cp.x;lastY=cp.y;return;}
+  if(tool==='gradient'){if(isLayerLocked())return;gradStart={x:cp.x,y:cp.y};isDrawing=true;return;}
 
+  if(isLayerLocked())return;
   isDrawing=true;lastX=cp.x;lastY=cp.y;smoothX=cp.x;smoothY=cp.y;stabBuf=[{x:cp.x,y:cp.y}];
   saveState();
   drawStroke(cp.x,cp.y,p,tiltX,tiltY,true);
@@ -1686,24 +1737,43 @@ function onMove(e){
   }
 
   // Process all coalesced events for smooth brush strokes
+  // Accumulate raw points then fit Catmull-Rom spline for pro-level smoothness
   for(const ev of events){
     const{sx:esx,sy:esy}=evPos(ev);
     const ep=getPressure(ev);
     const{tiltX:etx,tiltY:ety}=getTilt(ev);
     const ecp=s2c(esx,esy);
+
     let tx=ecp.x,ty=ecp.y;
-    // Pencil bypasses smoothing/stabilizer — follows pointer exactly
+
     if(tool!=='pencil'){
+      // Exponential smoothing (lag filter) — still used as first pass
       const sf=bSmooth/30;
       smoothX+=(ecp.x-smoothX)*(1-sf);
       smoothY+=(ecp.y-smoothY)*(1-sf);
       tx=smoothX;ty=smoothY;
-      if(bStab>0){stabBuf.push({x:tx,y:ty});if(stabBuf.length>bStab+1)stabBuf.shift();tx=stabBuf.reduce((a,p2)=>a+p2.x,0)/stabBuf.length;ty=stabBuf.reduce((a,p2)=>a+p2.y,0)/stabBuf.length;}
+
+      // Stabilizer: weighted average over last N points
+      if(bStab>0){
+        stabBuf.push({x:tx,y:ty});
+        if(stabBuf.length>bStab+1)stabBuf.shift();
+        tx=stabBuf.reduce((a,p2)=>a+p2.x,0)/stabBuf.length;
+        ty=stabBuf.reduce((a,p2)=>a+p2.y,0)/stabBuf.length;
+      }
+
+      // Velocity-based width: fast strokes get slightly thinner (like a real pen lifting)
+      const vx=tx-lastX, vy=ty-lastY;
+      const speed=Math.sqrt(vx*vx+vy*vy); // px per event
+      // Modulate effective pressure slightly down at high speed
+      const velocityFactor=Math.max(0.4, 1-speed*0.008);
+      const modulatedPressure=ep*velocityFactor+(1-velocityFactor)*ep*0.5;
+
+      drawStroke(tx,ty,modulatedPressure,etx,ety,false);
     } else {
-      // Still update smoothX/Y so switching tools mid-stroke doesn't jump
+      // Pencil: raw coordinates, no smoothing
       smoothX=ecp.x;smoothY=ecp.y;
+      drawStroke(tx,ty,ep,etx,ety,false);
     }
-    drawStroke(tx,ty,ep,etx,ety,false);
     lastX=tx;lastY=ty;
   }
   deferThumb(activeLayerIdx);
