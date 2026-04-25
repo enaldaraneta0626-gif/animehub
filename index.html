@@ -335,7 +335,7 @@ kbd{background:var(--bg3);border:1px solid var(--border);border-radius:3px;paddi
     <div class="psec"><div class="psec-label">Pressure → Opacity</div><div class="slider-row"><input type="range" id="pOpSlider" min="0" max="100" value="50" oninput="updateBrush()"><span class="slider-val" id="pOpVal">50%</span></div></div>
     <div class="psec"><div class="psec-label">Tilt → Angle</div><div class="slider-row"><input type="range" id="tiltSlider" min="0" max="100" value="0" oninput="updateBrush()"><span class="slider-val" id="tiltVal">0%</span></div></div>
     <div class="psec"><div class="psec-label">Angle</div><div class="slider-row"><input type="range" id="angleSlider" min="0" max="360" value="0" oninput="updateBrush()"><span class="slider-val" id="angleVal">0°</span></div></div>
-    <div class="psec"><div class="psec-label">Spacing</div><div class="slider-row"><input type="range" id="spacingSlider" min="1" max="100" value="10" oninput="updateBrush()"><span class="slider-val" id="spacingVal">10%</span></div></div>
+    <div class="psec"><div class="psec-label">Spacing</div><div class="slider-row"><input type="range" id="spacingSlider" min="1" max="100" value="4" oninput="updateBrush()"><span class="slider-val" id="spacingVal">4%</span></div></div>
     <div class="psec"><div class="psec-label">Rotation Jitter</div><div class="slider-row"><input type="range" id="jitterSlider" min="0" max="180" value="0" oninput="updateBrush()"><span class="slider-val" id="jitterVal">0°</span></div></div>
     <div class="psec">
       <div class="psec-label">Pressure Curve <span style="font-size:8px;color:var(--text3)">(drag to edit)</span></div>
@@ -1024,7 +1024,7 @@ function setBrushPreset(p,el){
   brushPreset=p;
   document.querySelectorAll('.bp').forEach(b=>b.classList.remove('active'));
   if(el)el.classList.add('active');
-  const P={round:{hard:80,spacing:10,angle:0,jitter:0},flat:{hard:90,spacing:8,angle:45,jitter:0},textured:{hard:35,spacing:18,angle:0,jitter:30},calligraphy:{hard:95,spacing:5,angle:315,jitter:0},scatter:{hard:30,spacing:60,angle:0,jitter:180},chalk:{hard:18,spacing:22,angle:0,jitter:20},ink:{hard:98,spacing:4,angle:0,jitter:0},watercolor:{hard:10,spacing:15,angle:0,jitter:10}};
+  const P={round:{hard:80,spacing:4,angle:0,jitter:0},flat:{hard:90,spacing:3,angle:45,jitter:0},textured:{hard:35,spacing:8,angle:0,jitter:30},calligraphy:{hard:95,spacing:2,angle:315,jitter:0},scatter:{hard:30,spacing:60,angle:0,jitter:180},chalk:{hard:18,spacing:10,angle:0,jitter:20},ink:{hard:98,spacing:2,angle:0,jitter:0},watercolor:{hard:10,spacing:6,angle:0,jitter:10}};
   const pr=P[p]||P.round;
   document.getElementById('hardSlider').value=pr.hard;
   document.getElementById('spacingSlider').value=pr.spacing;
@@ -1063,55 +1063,152 @@ function applyPressureCurve(p){
   return p;
 }
 
+// Per-stroke offscreen canvas so opacity doesn't accumulate between dabs
+let strokeCanvas=null,strokeCtx=null;
+let lastPressure=0.5; // tracked across events for smooth pressure interpolation
+let strokePointCount=0; // how many points in this stroke (for taper logic)
+
+function beginStrokeCanvas(){
+  if(!strokeCanvas||strokeCanvas.width!==CW||strokeCanvas.height!==CH){
+    strokeCanvas=document.createElement('canvas');
+    strokeCanvas.width=CW;strokeCanvas.height=CH;
+    strokeCtx=strokeCanvas.getContext('2d');
+  }
+  strokeCtx.clearRect(0,0,CW,CH);
+}
+
+function commitStrokeCanvas(destCtx,opacity,blendOp){
+  destCtx.save();
+  destCtx.globalAlpha=opacity;
+  destCtx.globalCompositeOperation=blendOp||'source-over';
+  destCtx.drawImage(strokeCanvas,0,0);
+  destCtx.restore();
+}
+
 function drawStroke(x,y,rawPressure,tiltX,tiltY,isStart){
   if(layers[activeLayerIdx].locked) return;
   const isPencil=tool==='pencil';
   const pressure=isPencil?1:applyPressureCurve(rawPressure);
-  const sz=brushSize*(isPencil?1:(1-bPressSize+bPressSize*pressure));
-  const al=isPencil?bOp:bOp*(1-bPressOp+bPressOp*pressure)*bFlow;
+
+  if(isStart){
+    // Taper in from 0 if pressure→size is active, otherwise start at full pressure
+    lastPressure=bPressSize>0?0:pressure;
+    strokePointCount=0;
+    beginStrokeCanvas();
+  }
+  strokePointCount++;
+
   let effectiveAngle=bAngle;
   if(!isPencil&&bTilt>0&&(tiltX||tiltY)){
     const tiltAngle=(Math.atan2(tiltY,tiltX)*180/Math.PI+360)%360;
     effectiveAngle=effectiveAngle*(1-bTilt)+tiltAngle*bTilt;
   }
-  const ctx=getActiveCtx();
-  if(isPencil)ctx.imageSmoothingEnabled=false;
-  const pts=[[x,y]];
-  if(showSym&&!editingMask) pts.push([CW-x,y]);
-  pts.forEach(([px,py])=>{
-    ctx.save();
-    ctx.globalCompositeOperation=tool==='eraser'?'destination-out':'source-over';
-    ctx.globalAlpha=al;
-    if(isPencil){
-      // Pixel-perfect hard square dab for pencil
-      const col=hexToRgbStr(fgColor);
-      const hw=Math.max(1,Math.round(sz/2));
-      ctx.fillStyle=`rgb(${col})`;
-      if(isStart){ctx.fillRect(Math.round(px)-hw,Math.round(py)-hw,hw*2,hw*2);ctx.restore();return;}
+  const destCtx=getActiveCtx();
+  const blendOp=tool==='eraser'?'destination-out':'source-over';
+
+  if(isPencil){
+    const sz=brushSize;
+    destCtx.save();
+    destCtx.globalCompositeOperation=blendOp;
+    destCtx.globalAlpha=bOp;
+    destCtx.imageSmoothingEnabled=false;
+    const col=hexToRgbStr(fgColor);
+    const hw=Math.max(1,Math.round(sz/2));
+    destCtx.fillStyle=`rgb(${col})`;
+    const pts=[[x,y]];
+    if(showSym&&!editingMask) pts.push([CW-x,y]);
+    pts.forEach(([px,py])=>{
+      if(isStart){destCtx.fillRect(Math.round(px)-hw,Math.round(py)-hw,hw*2,hw*2);return;}
       const lxm=px===x?lastX:CW-lastX;
-      // Bresenham line for crisp pixel pencil
       let x0=Math.round(lxm),y0=Math.round(lastY),x1=Math.round(px),y1=Math.round(py);
       const ddx=Math.abs(x1-x0),ddy=Math.abs(y1-y0);
       const sx2=x0<x1?1:-1,sy2=y0<y1?1:-1;
       let err=ddx-ddy;
-      while(true){ctx.fillRect(x0-hw,y0-hw,hw*2,hw*2);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-ddy){err-=ddy;x0+=sx2;}if(e2<ddx){err+=ddx;y0+=sy2;}}
-      ctx.restore();return;
+      while(true){destCtx.fillRect(x0-hw,y0-hw,hw*2,hw*2);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-ddy){err-=ddy;x0+=sx2;}if(e2<ddx){err+=ddx;y0+=sy2;}}
+    });
+    destCtx.restore();
+    lastPressure=pressure;
+    return;
+  }
+
+  const strokeOp=bOp*(1-bPressOp+bPressOp*pressure);
+  const pts=[[x,y]];
+  if(showSym&&!editingMask) pts.push([CW-x,y]);
+
+  pts.forEach(([px,py])=>{
+    const ctx=strokeCtx;
+    ctx.save();
+    ctx.globalCompositeOperation='source-over';
+
+    if(isStart){
+      ctx.globalAlpha=bFlow;
+      const sz=brushSize*(1-bPressSize+bPressSize*pressure);
+      paintDab(ctx,px,py,sz,1,effectiveAngle);
+      ctx.restore();
+      return;
     }
-    if(isStart){paintDab(ctx,px,py,sz,al,effectiveAngle);ctx.restore();return;}
+
     const lxm=px===x?lastX:CW-lastX;
-    const dxm=px-lxm,dy2=py-lastY;
+    const dxm=px-lxm, dy2=py-lastY;
     const dist=Math.sqrt(dxm*dxm+dy2*dy2);
-    const step=Math.max(0.5,sz*bSpacing/100);
-    let t=0;
-    while(t<dist){
-      const tt=dist>0?t/dist:0;
+    const step=Math.max(0.3,brushSize*(bSpacing/100)*0.5);
+    const numSteps=Math.max(1,Math.ceil(dist/step));
+
+    for(let i=1;i<=numSteps;i++){
+      const tt=i/numSteps;
+      // Interpolate pressure smoothly between last event and current event
+      const p=lastPressure+(pressure-lastPressure)*tt;
+      const sz=Math.max(0.5,brushSize*(1-bPressSize+bPressSize*p));
       const jitter=(Math.random()-.5)*bJitter;
-      paintDab(ctx,lxm+dxm*tt,lastY+dy2*tt,sz,al,effectiveAngle+jitter);
-      t+=step;
+      ctx.globalAlpha=bFlow;
+      paintDab(ctx,lxm+dxm*tt,lastY+dy2*tt,sz,1,effectiveAngle+jitter);
     }
     ctx.restore();
   });
-  if(isPencil)ctx.imageSmoothingEnabled=true;
+
+  destCtx.save();
+  destCtx.globalCompositeOperation=blendOp;
+  destCtx.globalAlpha=strokeOp;
+  destCtx.drawImage(strokeCanvas,0,0);
+  destCtx.restore();
+
+  lastPressure=pressure;
+}
+
+// Paint a pressure-taper tail at stroke end
+function finishStrokeTaper(x,y){
+  if(tool==='pencil'||!strokeCanvas||strokePointCount<2) return;
+  if(bPressSize<0.1) return; // only taper if pressure→size is meaningfully on
+
+  const destCtx=getActiveCtx();
+  const blendOp=tool==='eraser'?'destination-out':'source-over';
+  const effectiveAngle=bAngle;
+  const TAPER_STEPS=10;
+
+  // Direction: continue in last movement direction
+  const dx=x-lastX, dy=y-lastY;
+  const len=Math.sqrt(dx*dx+dy*dy)||1;
+  const nx=dx/len, ny=dy/len;
+  const step=Math.max(0.5,brushSize*0.12);
+
+  const ctx=strokeCtx;
+  ctx.save();
+  ctx.globalCompositeOperation='source-over';
+  for(let i=1;i<=TAPER_STEPS;i++){
+    const t=i/TAPER_STEPS;
+    const p=lastPressure*(1-t);   // ramp pressure to 0
+    const sz=Math.max(0.3,brushSize*(1-bPressSize+bPressSize*p));
+    if(sz<0.5) break;
+    ctx.globalAlpha=bFlow*(1-t*0.8);
+    paintDab(ctx,x+nx*step*i,y+ny*step*i,sz,1,effectiveAngle);
+  }
+  ctx.restore();
+
+  destCtx.save();
+  destCtx.globalCompositeOperation=blendOp;
+  destCtx.globalAlpha=bOp*(1-bPressOp+bPressOp*lastPressure*0.3);
+  destCtx.drawImage(strokeCanvas,0,0);
+  destCtx.restore();
 }
 
 function paintDab(ctx,x,y,size,alpha,angle){
@@ -1513,9 +1610,17 @@ function onMove(e){
 }
 
 function onUp(e){
-  transformDrag=null; // always clear regardless of tool
+  transformDrag=null;
   if(isPanning){isPanning=false;canvasArea.style.cursor=tool==='pan'?'grab':'none';return;}
   if(!isDrawing)return;
+
+  // Paint pressure-taper tail before ending stroke
+  if(['brush','eraser','smudge'].includes(tool)&&strokePointCount>1){
+    const{sx,sy}=evPos(e);
+    const cp=s2c(sx,sy);
+    finishStrokeTaper(cp.x,cp.y);
+  }
+
   isDrawing=false;
 
   if(tool==='shape'&&shapeStart){
